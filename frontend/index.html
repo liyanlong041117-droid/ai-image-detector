@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 图片检测器 - 智能识别 AI 生成图片</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <!-- 导航栏 -->
+    <nav class="navbar">
+        <div class="container">
+            <div class="logo">
+                <i class="fas fa-search"></i>
+                <span>AI 图片检测器</span>
+            </div>
+            <div class="nav-actions">
+                <button class="btn-icon" id="historyBtn" title="检测历史">
+                    <i class="fas fa-history"></i>
+                    <span class="badge" id="historyCount">0</span>
+                </button>
+                <button class="btn-icon" id="themeBtn" title="切换主题">
+                    <i class="fas fa-moon"></i>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主内容 -->
+    <main class="main-content">
+        <!-- Hero 区域 -->
+        <section class="hero">
+            <div class="container">
+                <h1><i class="fas fa-robot"></i> 智能识别 AI 生成图片</h1>
+                <p>上传图片，秒级检测是否为 AI 生成。保护您的视觉内容安全。</p>
+            </div>
+        </section>
+
+        <!-- 上传区域 -->
+        <section class="upload-section" id="uploadSection">
+            <div class="container">
+                <!-- 上传选项 -->
+                <div class="upload-options">
+                    <button class="upload-option active" data-method="file">
+                        <i class="fas fa-folder-open"></i>
+                        <span>选择文件</span>
+                    </button>
+                    <button class="upload-option" data-method="url">
+                        <i class="fas fa-link"></i>
+                        <span>粘贴 URL</span>
+                    </button>
+                    <button class="upload-option" data-method="camera">
+                        <i class="fas fa-camera"></i>
+                        <span>拍照</span>
+                    </button>
+                </div>
+
+                <!-- 拖拽上传区域 -->
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </div>
+                    <h3>拖拽图片到此处上传</h3>
+                    <p>或者点击选择文件</p>
+                    <div class="upload-formats">
+                        <span>支持格式：</span>
+                        <code>JPG</code>
+                        <code>PNG</code>
+                        <code>WebP</code>
+                    </div>
+                    <div class="upload-limit">
+                        <i class="fas fa-info-circle"></i>
+                        最大文件大小：10MB
+                    </div>
+                    <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" multiple hidden>
+                </div>
+
+                <!-- URL 输入区域 -->
+                <div class="url-input-area" id="urlInputArea" style="display: none;">
+                    <div class="url-input-wrapper">
+                        <input type="text" id="urlInput" placeholder="粘贴图片 URL...">
+                        <button class="btn-primary" id="fetchUrlBtn">
+                            <i class="fas fa-download"></i>
+                            获取图片
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 拍照区域 -->
+                <div class="camera-area" id="cameraArea" style="display: none;">
+                    <video id="cameraVideo" autoplay playsinline></video>
+                    <canvas id="cameraCanvas" style="display: none;"></canvas>
+                    <div class="camera-actions">
+                        <button class="btn-primary" id="captureBtn">
+                            <i class="fas fa-camera"></i>
+                            拍照
+                        </button>
+                        <button class="btn-secondary" id="stopCameraBtn">
+                            <i class="fas fa-stop"></i>
+                            关闭摄像头
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 批量上传提示 -->
+                <div class="batch-hint" id="batchHint">
+                    <i class="fas fa-images"></i>
+                    <span>已选择 <strong id="selectedCount">0</strong> 张图片</span>
+                    <button class="btn-text" id="clearSelectionBtn">清空</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 预览区域 -->
+        <section class="preview-section" id="previewSection" style="display: none;">
+            <div class="container">
+                <h2><i class="fas fa-eye"></i> 图片预览</h2>
+                <div class="preview-grid" id="previewGrid">
+                    <!-- 动态插入图片预览 -->
+                </div>
+                <div class="preview-actions">
+                    <button class="btn-primary" id="detectBtn">
+                        <i class="fas fa-search"></i>
+                        开始检测
+                    </button>
+                    <button class="btn-secondary" id="addMoreBtn">
+                        <i class="fas fa-plus"></i>
+                        继续添加
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 检测结果区域 -->
+        <section class="result-section" id="resultSection" style="display: none;">
+            <div class="container">
+                <h2><i class="fas fa-chart-bar"></i> 检测结果</h2>
+                <div class="results-container" id="resultsContainer">
+                    <!-- 动态插入检测结果 -->
+                </div>
+                <div class="result-actions">
+                    <button class="btn-secondary" id="downloadReportBtn">
+                        <i class="fas fa-download"></i>
+                        下载报告
+                    </button>
+                    <button class="btn-secondary" id="shareResultBtn">
+                        <i class="fas fa-share-alt"></i>
+                        分享结果
+                    </button>
+                    <button class="btn-text" id="detectNewBtn">
+                        <i class="fas fa-redo"></i>
+                        检测新图片
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 历史记录侧边栏 -->
+        <div class="sidebar-overlay" id="sidebarOverlay"></div>
+        <div class="sidebar" id="historySidebar">
+            <div class="sidebar-header">
+                <h3><i class="fas fa-history"></i> 检测历史</h3>
+                <button class="btn-close" id="closeHistoryBtn">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="sidebar-body" id="historyList">
+                <div class="empty-state">
+                    <i class="fas fa-inbox"></i>
+                    <p>暂无检测记录</p>
+                </div>
+            </div>
+            <div class="sidebar-footer">
+                <button class="btn-text" id="clearHistoryBtn">
+                    <i class="fas fa-trash"></i>
+                    清空历史
+                </button>
+            </div>
+        </div>
+    </main>
+
+    <!-- 加载动画 -->
+    <div class="loading-overlay" id="loadingOverlay" style="display: none;">
+        <div class="loading-spinner"></div>
+        <p class="loading-text" id="loadingText">正在检测中...</p>
+        <div class="loading-progress">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+    </div>
+
+    <!-- Toast 提示 -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- 页脚 -->
+    <footer class="footer">
+        <div class="container">
+            <p>AI 图片检测器 &copy; 2026 | 基于 Hugging Face 开源模型</p>
+            <p class="disclaimer">免责声明：检测结果仅供参考，不构成专业意见。</p>
+        </div>
+    </footer>
+
+    <script src="js/app.js"></script>
+    <script src="js/upload.js"></script>
+    <script src="js/detect.js"></script>
+    <script src="js/history.js"></script>
+    <script src="js/batch.js"></script>
+</body>
+</html>
