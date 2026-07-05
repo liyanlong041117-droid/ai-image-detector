@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import requests
-import base64
 import os
 import random
 from io import BytesIO
@@ -16,7 +15,7 @@ CORS(app)
 
 # 配置
 HUGGINGFACE_TOKEN = os.getenv('HUGGINGFACE_API_KEY', '')
-MODEL_NAME = 'Falconsai/ai_vs_real_image_detection'
+MODEL_NAME = 'dima806/ai_vs_real_image_detection'
 MAX_IMAGE_SIZE = (1024, 1024)
 JPEG_QUALITY = 85
 
@@ -107,31 +106,29 @@ def process_and_detect(file):
     if image.size[0] > MAX_IMAGE_SIZE[0] or image.size[1] > MAX_IMAGE_SIZE[1]:
         image.thumbnail(MAX_IMAGE_SIZE)
 
-    # 3. 转为 Base64
+    # 3. 统一转 RGB 并输出为 JPEG 二进制
     buffer = BytesIO()
-    # 统一转 RGB（某些图片可能是 RGBA/灰度）
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
     image.save(buffer, format='JPEG', quality=JPEG_QUALITY)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    image_bytes = buffer.getvalue()
 
     # 4. 调用检测
     if HUGGINGFACE_TOKEN:
-        return call_huggingface_api(image_base64)
+        return call_huggingface_api(image_bytes)
     else:
         return simulate_detection()
 
 
-def call_huggingface_api(image_base64):
+def call_huggingface_api(image_bytes):
     """调用 Hugging Face API"""
     try:
         response = requests.post(
             f'https://api-inference.huggingface.co/models/{MODEL_NAME}',
             headers={
-                'Authorization': f'Bearer {HUGGINGFACE_TOKEN}',
-                'Content-Type': 'application/json'
+                'Authorization': f'Bearer {HUGGINGFACE_TOKEN}'
             },
-            json={'inputs': image_base64},
+            data=image_bytes,
             timeout=30
         )
 
@@ -158,6 +155,8 @@ def call_huggingface_api(image_base64):
             }
 
         api_result = response.json()
+        # 添加调试日志
+        print(f"📦 HuggingFace API 原始返回: {api_result}")
         return parse_api_result(api_result)
 
     except requests.exceptions.Timeout:
@@ -184,15 +183,31 @@ def parse_api_result(api_result):
     """解析 Hugging Face API 返回结果"""
     ai_prob = 0
     real_prob = 0
+    
+    print(f"🔍 开始解析 API 结果: {api_result}")
 
     if isinstance(api_result, list):
         for item in api_result:
             label = item.get('label', '').lower()
             score = item.get('score', 0)
-            if 'ai' in label or 'fake' in label or 'generated' in label:
+            print(f"  - 标签: '{label}', 分数: {score}")
+            
+            # 常见标签模式
+            if 'ai' in label or 'fake' in label or 'generated' in label or 'artificial' in label:
                 ai_prob = score
-            elif 'real' in label or 'human' in label or 'natural' in label:
+                print(f"    → 识别为 AI 概率: {score}")
+            elif 'real' in label or 'human' in label or 'natural' in label or 'authentic' in label:
                 real_prob = score
+                print(f"    → 识别为真实概率: {score}")
+            elif label == 'label_0' or label == 'LABEL_0':
+                # 有些模型用 LABEL_0 表示 AI，LABEL_1 表示真实
+                ai_prob = score
+                print(f"    → LABEL_0 识别为 AI 概率: {score}")
+            elif label == 'label_1' or label == 'LABEL_1':
+                real_prob = score
+                print(f"    → LABEL_1 识别为真实概率: {score}")
+    
+    print(f"📊 解析结果: AI概率={ai_prob}, 真实概率={real_prob}")
 
     # 归一化
     total = ai_prob + real_prob
@@ -203,7 +218,9 @@ def parse_api_result(api_result):
         # 如果解析不到，给个默认值
         ai_prob = 0.5
         real_prob = 0.5
-
+    
+    print(f"📈 归一化后: AI概率={ai_prob}, 真实概率={real_prob}")
+    
     is_ai = ai_prob > 0.5
 
     return {
