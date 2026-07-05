@@ -5,8 +5,8 @@
 
 // ===== 全局配置 =====
 const CONFIG = {
-    // 后端 API 地址（使用相对路径，自动适配 Render 域名）
-    API_BASE_URL: '',
+    // 后端 API 地址（指向 Render 部署的服务）
+    API_BASE_URL: 'https://ai-image-detector-u376.onrender.com',
     // 最大文件大小（10MB）
     MAX_FILE_SIZE: 10 * 1024 * 1024,
     // 支持的文件类型

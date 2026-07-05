@@ -27,6 +27,26 @@ const Detect = {
         }
     },
 
+    // 带超时的 fetch（模型首次加载可能需要数分钟）
+    async fetchWithTimeout(url, options, timeout = 300000) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        try {
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            return response;
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (error.name === 'AbortError') {
+                throw new Error('请求超时：后端响应时间超过 5 分钟');
+            }
+            throw error;
+        }
+    },
+
     // 执行检测
     async runDetection() {
         if (APP_STATE.selectedFiles.length === 0) {
@@ -38,8 +58,8 @@ const Detect = {
         const isBatch = totalFiles > 1;
 
         showLoading(isBatch
-            ? `正在检测 ${totalFiles} 张图片...`
-            : '正在检测中...'
+            ? `正在检测 ${totalFiles} 张图片，首次检测可能需要 2-3 分钟...`
+            : '正在检测中，首次检测可能需要 2-3 分钟...'
         );
 
         APP_STATE.detectionResults = [];
@@ -52,7 +72,7 @@ const Detect = {
                     formData.append('files', file);
                 });
 
-                const response = await fetch(`${CONFIG.API_BASE_URL}/api/detect/batch`, {
+                const response = await this.fetchWithTimeout(`${CONFIG.API_BASE_URL}/api/detect/batch`, {
                     method: 'POST',
                     body: formData
                 });
@@ -74,7 +94,7 @@ const Detect = {
                 const formData = new FormData();
                 formData.append('file', file);
 
-                const response = await fetch(`${CONFIG.API_BASE_URL}/api/detect`, {
+                const response = await this.fetchWithTimeout(`${CONFIG.API_BASE_URL}/api/detect`, {
                     method: 'POST',
                     body: formData
                 });
@@ -112,9 +132,13 @@ const Detect = {
             hideLoading();
             console.error('检测失败:', err);
 
-            // 降级：使用模拟检测
-            showToast('后端连接失败，使用模拟检测...', 'warning');
-            this.runSimulation();
+            // 区分超时和其他错误
+            if (err.message.includes('超时')) {
+                showToast('请求超时，可能是模型正在加载，请稍后重试', 'error');
+            } else {
+                showToast('后端连接失败，使用模拟检测...', 'warning');
+                this.runSimulation();
+            }
         }
     },
 
