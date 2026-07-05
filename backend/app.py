@@ -1,8 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import requests
 import os
-import random
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
@@ -14,13 +12,31 @@ app = Flask(__name__)
 CORS(app)
 
 # 配置
-HUGGINGFACE_TOKEN = os.getenv('HUGGINGFACE_API_KEY', '')
 MODEL_NAME = 'dima806/ai_vs_real_image_detection'
 MAX_IMAGE_SIZE = (1024, 1024)
 JPEG_QUALITY = 85
 
 # 前端静态文件目录
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend')
+
+# 全局分类器（惰性加载，首次使用时初始化）
+_classifier = None
+
+
+def get_classifier():
+    """惰性加载 AI 检测模型到内存中"""
+    global _classifier
+    if _classifier is None:
+        print("🔄 正在加载 AI 检测模型，首次加载需要 1-2 分钟...")
+        from transformers import pipeline
+        import torch
+
+        # 限制 CPU 线程数以减少内存占用
+        torch.set_num_threads(1)
+
+        _classifier = pipeline("image-classification", model=MODEL_NAME)
+        print("✅ 模型加载完成！")
+    return _classifier
 
 
 @app.route('/')
@@ -93,7 +109,8 @@ def health_check():
     """健康检查"""
     return jsonify({
         'status': 'healthy',
-        'huggingface_configured': bool(HUGGINGFACE_TOKEN)
+        'model': MODEL_NAME,
+        'inference': 'local'
     })
 
 
@@ -113,65 +130,23 @@ def process_and_detect(file):
     image.save(buffer, format='JPEG', quality=JPEG_QUALITY)
     image_bytes = buffer.getvalue()
 
-    # 4. 调用检测
-    if HUGGINGFACE_TOKEN:
-        return call_huggingface_api(image_bytes)
-    else:
-        return simulate_detection()
+    # 4. 使用本地模型检测
+    return local_model_detect(image_bytes)
 
 
-def call_huggingface_api(image_bytes):
-    """调用 Hugging Face API"""
+def local_model_detect(image_bytes):
+    """使用本地 AI 模型进行推理"""
     try:
-        response = requests.post(
-            f'https://api-inference.huggingface.co/models/{MODEL_NAME}',
-            headers={
-                'Authorization': f'Bearer {HUGGINGFACE_TOKEN}'
-            },
-            data=image_bytes,
-            timeout=30
-        )
-
-        if response.status_code == 503:
-            # 模型正在加载，等待重试
-            estimated_time = response.json().get('estimated_time', 20)
-            return {
-                'success': False,
-                'error': f'模型正在加载，预计等待 {estimated_time} 秒，请重试',
-                'isAIGenerated': False,
-                'confidence': 0,
-                'aiProbability': 0,
-                'realProbability': 0
-            }
-
-        if response.status_code != 200:
-            return {
-                'success': False,
-                'error': f'API 返回错误 (状态码: {response.status_code})',
-                'isAIGenerated': False,
-                'confidence': 0,
-                'aiProbability': 0,
-                'realProbability': 0
-            }
-
-        api_result = response.json()
-        # 添加调试日志
-        print(f"📦 HuggingFace API 原始返回: {api_result}")
+        image = Image.open(BytesIO(image_bytes))
+        classifier = get_classifier()
+        api_result = classifier(image)
+        print(f"📦 本地模型推理结果: {api_result}")
         return parse_api_result(api_result)
 
-    except requests.exceptions.Timeout:
-        return {
-            'success': False,
-            'error': 'API 调用超时，请重试',
-            'isAIGenerated': False,
-            'confidence': 0,
-            'aiProbability': 0,
-            'realProbability': 0
-        }
     except Exception as e:
         return {
             'success': False,
-            'error': f'API 调用失败: {str(e)}',
+            'error': f'模型推理失败: {str(e)}',
             'isAIGenerated': False,
             'confidence': 0,
             'aiProbability': 0,
@@ -180,18 +155,18 @@ def call_huggingface_api(image_bytes):
 
 
 def parse_api_result(api_result):
-    """解析 Hugging Face API 返回结果"""
+    """解析模型返回结果"""
     ai_prob = 0
     real_prob = 0
-    
-    print(f"🔍 开始解析 API 结果: {api_result}")
+
+    print(f"🔍 开始解析结果: {api_result}")
 
     if isinstance(api_result, list):
         for item in api_result:
             label = item.get('label', '').lower()
             score = item.get('score', 0)
             print(f"  - 标签: '{label}', 分数: {score}")
-            
+
             # 常见标签模式
             if 'ai' in label or 'fake' in label or 'generated' in label or 'artificial' in label:
                 ai_prob = score
@@ -200,13 +175,12 @@ def parse_api_result(api_result):
                 real_prob = score
                 print(f"    → 识别为真实概率: {score}")
             elif label == 'label_0' or label == 'LABEL_0':
-                # 有些模型用 LABEL_0 表示 AI，LABEL_1 表示真实
                 ai_prob = score
                 print(f"    → LABEL_0 识别为 AI 概率: {score}")
             elif label == 'label_1' or label == 'LABEL_1':
                 real_prob = score
                 print(f"    → LABEL_1 识别为真实概率: {score}")
-    
+
     print(f"📊 解析结果: AI概率={ai_prob}, 真实概率={real_prob}")
 
     # 归一化
@@ -218,9 +192,9 @@ def parse_api_result(api_result):
         # 如果解析不到，给个默认值
         ai_prob = 0.5
         real_prob = 0.5
-    
+
     print(f"📈 归一化后: AI概率={ai_prob}, 真实概率={real_prob}")
-    
+
     is_ai = ai_prob > 0.5
 
     return {
@@ -236,25 +210,6 @@ def parse_api_result(api_result):
     }
 
 
-def simulate_detection():
-    """模拟检测（用于演示或无 Token 时的降级）"""
-    ai_prob = random.uniform(0.25, 0.85)
-    real_prob = 1 - ai_prob
-    is_ai = ai_prob > 0.5
-
-    return {
-        'success': True,
-        'isAIGenerated': is_ai,
-        'confidence': max(ai_prob, real_prob),
-        'aiProbability': ai_prob,
-        'realProbability': real_prob,
-        'details': {
-            'model': 'simulation',
-            'warning': '此为模拟结果。请配置 HUGGINGFACE_API_KEY 环境变量以连接真实检测模型。'
-        }
-    }
-
-
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
@@ -263,7 +218,8 @@ if __name__ == '__main__':
 ║     AI 图片检测器 - 后端服务             ║
 ║     运行地址: http://0.0.0.0:{port}   ║
 ╠══════════════════════════════════════════╣
-║     HuggingFace 状态: {'已配置 ✅' if HUGGINGFACE_TOKEN else '未配置 ⚠️ (将使用模拟检测)'}  ║
+║     检测模式: 本地模型推理 🔬            ║
+║     使用模型: {MODEL_NAME}              ║
 ╚══════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=port, debug=debug)
