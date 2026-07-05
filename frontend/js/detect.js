@@ -185,8 +185,21 @@ const Detect = {
 
     // 处理检测结果（单张或批量）
     handleDetectionResult(data, isBatch) {
+        // 单张检测时，如果后端返回失败，直接提示错误
+        if (!isBatch && !data.success) {
+            hideLoading();
+            showToast(data.error || '检测失败，请稍后重试', 'error');
+            return;
+        }
+
         if (isBatch) {
-            APP_STATE.detectionResults = (data.results || []).map((r, i) => ({
+            // 批量模式下过滤掉失败项，并给出提示
+            const rawResults = data.results || [];
+            const failedCount = rawResults.filter(r => !r.success).length;
+            if (failedCount > 0) {
+                showToast(`${failedCount} 张图片检测失败`, 'warning');
+            }
+            APP_STATE.detectionResults = rawResults.map((r, i) => ({
                 ...r,
                 fileName: APP_STATE.selectedFiles[i]?.name || '未知文件',
                 fileSize: APP_STATE.selectedFiles[i]?.size || 0,

@@ -178,26 +178,34 @@ def call_hf_api(image_bytes):
 
 
 def parse_api_result(api_result):
-    """解析 Hugging Face API 返回结果"""
+    """解析 Hugging Face API 返回结果，兼容嵌套列表和字典格式"""
     ai_prob = 0
     real_prob = 0
 
     print(f"🔍 开始解析结果: {api_result}")
 
+    # 扁平化：处理 [[{...}]]、[{...}]、{...} 等多种格式
+    items = []
     if isinstance(api_result, list):
         for item in api_result:
-            label = item.get('label', '').lower()
-            score = item.get('score', 0)
-            print(f"  - 标签: '{label}', 分数: {score}")
+            if isinstance(item, list):
+                items.extend(item)
+            elif isinstance(item, dict):
+                items.append(item)
+    elif isinstance(api_result, dict):
+        items.append(api_result)
 
-            if 'ai' in label or 'fake' in label or 'generated' in label or 'artificial' in label:
-                ai_prob = score
-            elif 'real' in label or 'human' in label or 'natural' in label or 'authentic' in label:
-                real_prob = score
-            elif label in ('label_0', 'LABEL_0'):
-                ai_prob = score
-            elif label in ('label_1', 'LABEL_1'):
-                real_prob = score
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get('label', '')).lower()
+        score = float(item.get('score', 0))
+        print(f"  - 标签: '{label}', 分数: {score}")
+
+        if 'ai' in label or 'fake' in label or 'generated' in label or 'artificial' in label or 'label_0' in label:
+            ai_prob = score
+        elif 'real' in label or 'human' in label or 'natural' in label or 'authentic' in label or 'label_1' in label:
+            real_prob = score
 
     print(f"📊 解析结果: AI概率={ai_prob}, 真实概率={real_prob}")
 
