@@ -115,7 +115,7 @@ function showLoading(text = '正在检测中...') {
     const loadingText = document.getElementById('loadingText');
     const progressBar = document.getElementById('progressBar');
 
-    loadingText.textContent = text;
+    loadingText.innerHTML = text;
     progressBar.style.width = '10%';
     overlay.style.display = 'flex';
 

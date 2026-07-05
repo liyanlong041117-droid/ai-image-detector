@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
+import requests
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
@@ -13,30 +14,13 @@ CORS(app)
 
 # 配置
 MODEL_NAME = 'dima806/ai_vs_real_image_detection'
+HF_API_URL = f'https://api-inference.huggingface.co/models/{MODEL_NAME}'
+HF_API_KEY = os.getenv('HUGGINGFACE_API_KEY', '')
 MAX_IMAGE_SIZE = (1024, 1024)
 JPEG_QUALITY = 85
 
 # 前端静态文件目录
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend')
-
-# 全局分类器（惰性加载，首次使用时初始化）
-_classifier = None
-
-
-def get_classifier():
-    """惰性加载 AI 检测模型到内存中"""
-    global _classifier
-    if _classifier is None:
-        print("🔄 正在加载 AI 检测模型，首次加载需要 1-2 分钟...")
-        from transformers import pipeline
-        import torch
-
-        # 限制 CPU 线程数以减少内存占用
-        torch.set_num_threads(1)
-
-        _classifier = pipeline("image-classification", model=MODEL_NAME)
-        print("✅ 模型加载完成！")
-    return _classifier
 
 
 @app.route('/')
@@ -62,7 +46,13 @@ def detect_image():
         return jsonify({'success': False, 'error': '文件名为空'}), 400
 
     try:
-        result = process_and_detect(file)
+        image_bytes = process_image(file)
+        result = call_hf_api(image_bytes)
+
+        # 如果模型正在加载，返回特殊状态码 202，前端会轮询
+        if result.get('status') == 'model_loading':
+            return jsonify(result), 202
+
         return jsonify(result)
 
     except Exception as e:
@@ -89,7 +79,12 @@ def detect_batch():
     results = []
     for file in files:
         try:
-            result = process_and_detect(file)
+            image_bytes = process_image(file)
+            result = call_hf_api(image_bytes)
+            # 批量模式下，如果模型加载中，标记后继续（不阻塞）
+            if result.get('status') == 'model_loading':
+                result['success'] = False
+                result['error'] = '模型正在加载，请稍后单独重试该图片'
             results.append(result)
         except Exception as e:
             results.append({
@@ -110,43 +105,71 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'model': MODEL_NAME,
-        'inference': 'local'
+        'inference': 'huggingface_api'
     })
 
 
-def process_and_detect(file):
-    """处理图片并检测"""
-    # 1. 打开图片
+def process_image(file):
+    """处理图片：压缩 + 转 JPEG 二进制"""
     image = Image.open(file)
-
-    # 2. 压缩图片（限制尺寸）
     if image.size[0] > MAX_IMAGE_SIZE[0] or image.size[1] > MAX_IMAGE_SIZE[1]:
         image.thumbnail(MAX_IMAGE_SIZE)
-
-    # 3. 统一转 RGB 并输出为 JPEG 二进制
     buffer = BytesIO()
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
     image.save(buffer, format='JPEG', quality=JPEG_QUALITY)
-    image_bytes = buffer.getvalue()
-
-    # 4. 使用本地模型检测
-    return local_model_detect(image_bytes)
+    return buffer.getvalue()
 
 
-def local_model_detect(image_bytes):
-    """使用本地 AI 模型进行推理"""
+def call_hf_api(image_bytes):
+    """
+    调用 Hugging Face Inference API
+    直接发送图片二进制（application/octet-stream）
+    返回标准结果格式，如果模型正在加载则 status='model_loading'
+    """
+    hf_headers = {
+        'Authorization': f'Bearer {HF_API_KEY}',
+        'Content-Type': 'application/octet-stream'
+    }
+
     try:
-        image = Image.open(BytesIO(image_bytes))
-        classifier = get_classifier()
-        api_result = classifier(image)
-        print(f"📦 本地模型推理结果: {api_result}")
+        hf_response = requests.post(
+            HF_API_URL,
+            headers=hf_headers,
+            data=image_bytes,   # 直接发二进制，不用 base64
+            timeout=60
+        )
+
+        # 模型正在加载（冷启动）
+        if hf_response.status_code in (503, 500):
+            try:
+                error_info = hf_response.json()
+            except Exception:
+                error_info = {}
+            estimated_time = error_info.get('estimated_time', 20)
+            return {
+                'status': 'model_loading',
+                'success': False,
+                'error': '模型正在启动，请稍候...',
+                'estimatedTime': estimated_time
+            }
+
+        hf_response.raise_for_status()
+        api_result = hf_response.json()
+        print(f"📦 Hugging Face API 返回: {api_result}")
         return parse_api_result(api_result)
 
+    except requests.exceptions.Timeout:
+        return {
+            'status': 'model_loading',
+            'success': False,
+            'error': '请求超时，模型可能正在加载',
+            'estimatedTime': 30
+        }
     except Exception as e:
         return {
             'success': False,
-            'error': f'模型推理失败: {str(e)}',
+            'error': f'API 调用失败: {str(e)}',
             'isAIGenerated': False,
             'confidence': 0,
             'aiProbability': 0,
@@ -155,7 +178,7 @@ def local_model_detect(image_bytes):
 
 
 def parse_api_result(api_result):
-    """解析模型返回结果"""
+    """解析 Hugging Face API 返回结果"""
     ai_prob = 0
     real_prob = 0
 
@@ -167,19 +190,14 @@ def parse_api_result(api_result):
             score = item.get('score', 0)
             print(f"  - 标签: '{label}', 分数: {score}")
 
-            # 常见标签模式
             if 'ai' in label or 'fake' in label or 'generated' in label or 'artificial' in label:
                 ai_prob = score
-                print(f"    → 识别为 AI 概率: {score}")
             elif 'real' in label or 'human' in label or 'natural' in label or 'authentic' in label:
                 real_prob = score
-                print(f"    → 识别为真实概率: {score}")
-            elif label == 'label_0' or label == 'LABEL_0':
+            elif label in ('label_0', 'LABEL_0'):
                 ai_prob = score
-                print(f"    → LABEL_0 识别为 AI 概率: {score}")
-            elif label == 'label_1' or label == 'LABEL_1':
+            elif label in ('label_1', 'LABEL_1'):
                 real_prob = score
-                print(f"    → LABEL_1 识别为真实概率: {score}")
 
     print(f"📊 解析结果: AI概率={ai_prob}, 真实概率={real_prob}")
 
@@ -189,11 +207,8 @@ def parse_api_result(api_result):
         ai_prob = ai_prob / total
         real_prob = real_prob / total
     else:
-        # 如果解析不到，给个默认值
         ai_prob = 0.5
         real_prob = 0.5
-
-    print(f"📈 归一化后: AI概率={ai_prob}, 真实概率={real_prob}")
 
     is_ai = ai_prob > 0.5
 
@@ -214,12 +229,12 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
     print(f"""
-╔══════════════════════════════════════════╗
-║     AI 图片检测器 - 后端服务             ║
-║     运行地址: http://0.0.0.0:{port}   ║
-╠══════════════════════════════════════════╣
-║     检测模式: 本地模型推理 🔬            ║
-║     使用模型: {MODEL_NAME}              ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║       AI 图片检测器 - 后端服务                   ║
+║       运行地址: http://0.0.0.0:{port}           ║
+╠══════════════════════════════════════════════════╣
+║       检测模式: Hugging Face API ☁️              ║
+║       使用模型: {MODEL_NAME}                     ║
+╚══════════════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=port, debug=debug)

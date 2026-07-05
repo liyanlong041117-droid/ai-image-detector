@@ -1,11 +1,17 @@
 /**
  * detect.js - AI 检测核心模块
  * 调用后端 API 进行 AI 图片检测
+ * 支持模型冷启动自动轮询重试
  */
 
 const Detect = {
     detectBtn: null,
     detectNewBtn: null,
+    _pollingTimer: null,      // 轮询定时器
+    _pollingCount: 0,        // 已轮询次数
+    _maxPolling: 12,         // 最多轮询 12 次（每次 5 秒 = 最多 60 秒）
+    _pollingFormData: null,  // 轮询时重用的表单数据
+    _pollingIsBatch: false,  // 是否批量检测
 
     init() {
         this.detectBtn = document.getElementById('detectBtn');
@@ -17,6 +23,8 @@ const Detect = {
 
         if (this.detectNewBtn) {
             this.detectNewBtn.addEventListener('click', () => {
+                // 停止可能的轮询
+                this.stopPolling();
                 APP_STATE.selectedFiles = [];
                 APP_STATE.detectionResults = [];
                 Upload.updateBatchHint();
@@ -27,8 +35,18 @@ const Detect = {
         }
     },
 
-    // 带超时的 fetch（模型首次加载可能需要数分钟）
-    async fetchWithTimeout(url, options, timeout = 300000) {
+    // 停止轮询
+    stopPolling() {
+        if (this._pollingTimer) {
+            clearTimeout(this._pollingTimer);
+            this._pollingTimer = null;
+        }
+        this._pollingCount = 0;
+        this._pollingFormData = null;
+    },
+
+    // 带超时的 fetch
+    async fetchWithTimeout(url, options, timeout = 60000) {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeout);
         try {
@@ -41,14 +59,17 @@ const Detect = {
         } catch (error) {
             clearTimeout(timeoutId);
             if (error.name === 'AbortError') {
-                throw new Error('请求超时：后端响应时间超过 5 分钟');
+                throw new Error('请求超时，请稍后重试');
             }
             throw error;
         }
     },
 
-    // 执行检测
+    // 执行检测（入口）
     async runDetection() {
+        // 停止上一次的轮询
+        this.stopPolling();
+
         if (APP_STATE.selectedFiles.length === 0) {
             showToast('请先选择图片', 'warning');
             return;
@@ -56,90 +77,145 @@ const Detect = {
 
         const totalFiles = APP_STATE.selectedFiles.length;
         const isBatch = totalFiles > 1;
+        this._pollingIsBatch = isBatch;
 
         showLoading(isBatch
-            ? `正在检测 ${totalFiles} 张图片，首次检测可能需要 2-3 分钟...`
-            : '正在检测中，首次检测可能需要 2-3 分钟...'
+            ? `正在检测 ${totalFiles} 张图片...`
+            : '正在检测中...'
         );
 
         APP_STATE.detectionResults = [];
 
+        // 构建表单数据（保存一份用于轮询重试）
+        const formData = new FormData();
+        if (isBatch) {
+            APP_STATE.selectedFiles.forEach(file => {
+                formData.append('files', file);
+            });
+        } else {
+            formData.append('file', APP_STATE.selectedFiles[0]);
+        }
+        this._pollingFormData = formData;
+
         try {
-            if (isBatch) {
-                // 批量检测
-                const formData = new FormData();
-                APP_STATE.selectedFiles.forEach(file => {
-                    formData.append('files', file);
-                });
+            const url = isBatch
+                ? `${CONFIG.API_BASE_URL}/api/detect/batch`
+                : `${CONFIG.API_BASE_URL}/api/detect`;
 
-                const response = await this.fetchWithTimeout(`${CONFIG.API_BASE_URL}/api/detect/batch`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    throw new Error(`服务器错误: ${response.status}`);
-                }
-
-                const data = await response.json();
-                APP_STATE.detectionResults = data.results.map((r, i) => ({
-                    ...r,
-                    fileName: APP_STATE.selectedFiles[i].name,
-                    fileSize: APP_STATE.selectedFiles[i].size,
-                    timestamp: new Date().toISOString(),
-                }));
-            } else {
-                // 单张检测
-                const file = APP_STATE.selectedFiles[0];
-                const formData = new FormData();
-                formData.append('file', file);
-
-                const response = await this.fetchWithTimeout(`${CONFIG.API_BASE_URL}/api/detect`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    throw new Error(`服务器错误: ${response.status}`);
-                }
-
-                const data = await response.json();
-                APP_STATE.detectionResults = [{
-                    ...data,
-                    fileName: file.name,
-                    fileSize: file.size,
-                    timestamp: new Date().toISOString(),
-                }];
-            }
-
-            hideLoading();
-            this.renderResults();
-            showResultSection();
-
-            // 保存到历史记录
-            APP_STATE.detectionResults.forEach(result => {
-                History.addRecord(result);
+            const response = await this.fetchWithTimeout(url, {
+                method: 'POST',
+                body: formData
             });
 
-            showToast(
-                isBatch
-                    ? `已完成 ${APP_STATE.detectionResults.length} 张图片的检测`
-                    : '检测完成！',
-                'success'
-            );
+            // 状态码 202 = 模型正在加载，需要轮询
+            if (response.status === 202) {
+                const data = await response.json();
+                this.startPolling(data.estimatedTime || 20);
+                return;
+            }
+
+            if (!response.ok) {
+                throw new Error(`服务器错误: ${response.status}`);
+            }
+
+            const data = await response.json();
+            this.handleDetectionResult(data, isBatch);
 
         } catch (err) {
             hideLoading();
             console.error('检测失败:', err);
-
-            // 区分超时和其他错误
-            if (err.message.includes('超时')) {
-                showToast('请求超时，可能是模型正在加载，请稍后重试', 'error');
-            } else {
-                showToast('后端连接失败，使用模拟检测...', 'warning');
-                this.runSimulation();
-            }
+            showToast('检测失败：' + err.message, 'error');
         }
+    },
+
+    // 开始轮询（模型冷启动）
+    startPolling(estimatedTime) {
+        this._pollingCount = 0;
+        const waitSec = Math.max(5, Math.ceil(estimatedTime / 2)); // 每次等 5 秒以上
+
+        showLoading(`⏳ 模型正在启动中，预计需要 ${estimatedTime} 秒...<br><small>已自动等待，请勿关闭页面</small>`);
+
+        const poll = () => {
+            this._pollingCount++;
+            if (this._pollingCount > this._maxPolling) {
+                hideLoading();
+                this.stopPolling();
+                showToast('模型启动超时，请稍后手动重试', 'error');
+                return;
+            }
+
+            // 更新加载提示
+            const remaining = this._maxPolling - this._pollingCount;
+            showLoading(`⏳ 模型启动中，正在第 ${this._pollingCount} 次重试...<br><small>最多再试 ${remaining} 次，请稍候</small>`);
+
+            const url = this._pollingIsBatch
+                ? `${CONFIG.API_BASE_URL}/api/detect/batch`
+                : `${CONFIG.API_BASE_URL}/api/detect`;
+
+            this.fetchWithTimeout(url, {
+                method: 'POST',
+                body: this._pollingFormData
+            })
+            .then(async (response) => {
+                if (response.status === 202) {
+                    // 还在加载，继续轮询
+                    this._pollingTimer = setTimeout(poll, waitSec * 1000);
+                    return;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`服务器错误: ${response.status}`);
+                }
+
+                const data = await response.json();
+                this.stopPolling();
+                this.handleDetectionResult(data, this._pollingIsBatch);
+            })
+            .catch((err) => {
+                hideLoading();
+                this.stopPolling();
+                console.error('轮询失败:', err);
+                showToast('检测失败：' + err.message, 'error');
+            });
+        };
+
+        // 首次等待后开始轮询
+        this._pollingTimer = setTimeout(poll, waitSec * 1000);
+    },
+
+    // 处理检测结果（单张或批量）
+    handleDetectionResult(data, isBatch) {
+        if (isBatch) {
+            APP_STATE.detectionResults = (data.results || []).map((r, i) => ({
+                ...r,
+                fileName: APP_STATE.selectedFiles[i]?.name || '未知文件',
+                fileSize: APP_STATE.selectedFiles[i]?.size || 0,
+                timestamp: new Date().toISOString(),
+            }));
+        } else {
+            APP_STATE.detectionResults = [{
+                ...data,
+                fileName: APP_STATE.selectedFiles[0]?.name || '未知文件',
+                fileSize: APP_STATE.selectedFiles[0]?.size || 0,
+                timestamp: new Date().toISOString(),
+            }];
+        }
+
+        hideLoading();
+        this.renderResults();
+        showResultSection();
+
+        // 保存到历史记录
+        APP_STATE.detectionResults.forEach(result => {
+            History.addRecord(result);
+        });
+
+        showToast(
+            isBatch
+                ? `已完成 ${APP_STATE.detectionResults.length} 张图片的检测`
+                : '检测完成！',
+            'success'
+        );
     },
 
     // 模拟检测（后端不可用时的降级方案）
