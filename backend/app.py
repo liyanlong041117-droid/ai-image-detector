@@ -37,7 +37,7 @@ def serve_static(filename):
 
 @app.route('/api/detect', methods=['POST'])
 def detect_image():
-    """检测单张图片"""
+    """检测单张图片（启用 TTA）"""
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': '没有上传文件'}), 400
 
@@ -46,8 +46,11 @@ def detect_image():
         return jsonify({'success': False, 'error': '文件名为空'}), 400
 
     try:
-        image_bytes = process_image(file)
-        result = call_hf_api(image_bytes)
+        # process_image 现在返回 PIL Image
+        image = process_image(file)
+        
+        # 使用 TTA 检测
+        result = detect_single_with_tta(image)
 
         # 如果模型正在加载，返回特殊状态码 202，前端会轮询
         if result.get('status') == 'model_loading':
@@ -68,7 +71,7 @@ def detect_image():
 
 @app.route('/api/detect/batch', methods=['POST'])
 def detect_batch():
-    """批量检测"""
+    """批量检测（启用 TTA）"""
     if 'files' not in request.files:
         return jsonify({'success': False, 'error': '没有上传文件'}), 400
 
@@ -79,8 +82,12 @@ def detect_batch():
     results = []
     for file in files:
         try:
-            image_bytes = process_image(file)
-            result = call_hf_api(image_bytes)
+            # process_image 现在返回 PIL Image
+            image = process_image(file)
+            
+            # 使用 TTA 检测
+            result = detect_single_with_tta(image)
+            
             # 批量模式下，如果模型加载中，标记后继续（不阻塞）
             if result.get('status') == 'model_loading':
                 result['success'] = False
@@ -110,13 +117,21 @@ def health_check():
 
 
 def process_image(file):
-    """处理图片：压缩 + 转 JPEG 二进制"""
+    """
+    处理图片：压缩 + 转 RGB
+    返回 PIL Image 对象（用于 TTA 变换）
+    """
     image = Image.open(file)
     if image.size[0] > MAX_IMAGE_SIZE[0] or image.size[1] > MAX_IMAGE_SIZE[1]:
-        image.thumbnail(MAX_IMAGE_SIZE)
-    buffer = BytesIO()
+        image.thumbnail(MAX_IMAGE_SIZE, Image.Resampling.LANCZOS)
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
+    return image
+
+
+def image_to_bytes(image):
+    """将 PIL Image 转为 JPEG 格式的 bytes（用于 API 调用）"""
+    buffer = BytesIO()
     image.save(buffer, format='JPEG', quality=JPEG_QUALITY)
     return buffer.getvalue()
 
@@ -175,6 +190,115 @@ def call_hf_api(image_bytes):
             'aiProbability': 0,
             'realProbability': 0
         }
+
+
+def get_tta_variants(image):
+    """
+    生成 TTA 变体（4 个版本）
+    1. 原图
+    2. 水平翻转
+    3. 中心裁剪 90% 后缩放回原尺寸
+    4. 放大 110% 后中心裁剪
+    """
+    variants = []
+
+    # 1. 原图
+    variants.append(image.copy())
+
+    # 2. 水平翻转
+    variants.append(image.transpose(Image.FLIP_LEFT_RIGHT))
+
+    # 3. 中心裁剪 90% 后缩放
+    w, h = image.size
+    crop_margin_w = int(w * 0.05)
+    crop_margin_h = int(h * 0.05)
+    cropped = image.crop((crop_margin_w, crop_margin_h, w - crop_margin_w, h - crop_margin_h))
+    resized = cropped.resize((w, h), Image.Resampling.LANCZOS)
+    variants.append(resized)
+
+    # 4. 放大 110% 后中心裁剪
+    zoom = 1.1
+    new_w, new_h = int(w * zoom), int(h * zoom)
+    zoomed = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    left = (new_w - w) // 2
+    top = (new_h - h) // 2
+    cropped_zoom = zoomed.crop((left, top, left + w, top + h))
+    variants.append(cropped_zoom)
+
+    return variants
+
+
+def detect_single_with_tta(image):
+    """
+    对单张图片进行 TTA 检测
+    串行调用 4 次 API（原图 + 3 个变体）
+    返回聚合后的结果
+    """
+    variants = get_tta_variants(image)
+    all_results = []
+
+    for idx, variant in enumerate(variants):
+        image_bytes = image_to_bytes(variant)
+        result = call_hf_api(image_bytes)
+
+        # 如果模型正在加载，直接返回（前端会轮询）
+        if result.get('status') == 'model_loading':
+            return result
+
+        if result.get('success'):
+            all_results.append(result)
+        else:
+            print(f"⚠️ TTA 变体 {idx + 1} 检测失败: {result.get('error')}")
+
+    if not all_results:
+        return {
+            'success': False,
+            'error': '所有 TTA 变体检测均失败',
+            'isAIGenerated': False,
+            'confidence': 0,
+            'aiProbability': 0,
+            'realProbability': 0
+        }
+
+    # 聚合结果
+    return aggregate_tta_results(all_results)
+
+
+def aggregate_tta_results(results):
+    """
+    聚合多次 TTA 检测结果
+    对 aiProbability 和 realProbability 取平均后归一化
+    """
+    total_ai = sum(r.get('aiProbability', 0) for r in results)
+    total_real = sum(r.get('realProbability', 0) for r in results)
+
+    # 平均
+    avg_ai = total_ai / len(results)
+    avg_real = total_real / len(results)
+
+    # 归一化
+    total = avg_ai + avg_real
+    if total > 0:
+        avg_ai = avg_ai / total
+        avg_real = avg_real / total
+    else:
+        avg_ai = 0.5
+        avg_real = 0.5
+
+    is_ai = avg_ai > 0.5
+
+    return {
+        'success': True,
+        'isAIGenerated': is_ai,
+        'confidence': max(avg_ai, avg_real),
+        'aiProbability': avg_ai,
+        'realProbability': avg_real,
+        'details': {
+            'model': MODEL_NAME,
+            'ttaVariants': len(results),
+            'rawResults': [r.get('details', {}).get('rawResult') for r in results]
+        }
+    }
 
 
 def parse_api_result(api_result):
