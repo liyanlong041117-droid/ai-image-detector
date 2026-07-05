@@ -14,7 +14,7 @@ CORS(app)
 
 # 配置
 MODEL_NAME = 'dima806/ai_vs_real_image_detection'
-HF_API_URL = f'https://router.huggingface.co/hf-inference/{MODEL_NAME}'
+HF_API_URL = f'https://router.huggingface.co/hf-inference/models/{MODEL_NAME}'
 HF_API_KEY = os.getenv('HUGGINGFACE_API_KEY', '')
 MAX_IMAGE_SIZE = (1024, 1024)
 JPEG_QUALITY = 85
